@@ -3,6 +3,10 @@
 # SuperRecomp
 Tool to statically recompile SNES games into native executables. The project is in a very early stage. So C code generation is still experimental and messy sometimes.
 
+Demonstration of the tool itself using a clean dump of [Super Mario World](https://en.wikipedia.org/wiki/Super_Mario_World) without a 512-byte header.
+
+https://github.com/user-attachments/assets/bc8e781c-8fc8-4a88-9fce-41251fe4a63e
+
 # UltraRecomp
 The first "Target" in the "UltraRecomp" series. Many more (including GameCube, Wii U, PS1 and PS1. And maybe also Xbox 360)  will come.
 
