@@ -1,0 +1,13 @@
+// Build files should be ignored by git
+build/
+// Temporary files should be ignored by git
+*.tmp
+*.log
+// Object files should be ignored by git
+*.o
+// Executable files should be ignored by git
+*.exe
+*.out
+// ROM files should be ignored by git
+*.sfc
+*.smc
