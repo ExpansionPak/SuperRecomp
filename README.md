@@ -1,3 +1,5 @@
+[![image](misc/SRecomp.png)](https://github.com/ExpansionPak/SuperRecomp)
+
 # SuperRecomp
 Tool to statically recompile SNES games into native executables. The project is in a very early stage. So the only thing as of now is ROM file reading.
 
