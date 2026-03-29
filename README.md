@@ -5,7 +5,7 @@ A tool to statically recompile [SNES](https://en.wikipedia.org/wiki/Super_Ninten
 
 Demonstration of the tool itself using a clean dump of [Super Mario World](https://en.wikipedia.org/wiki/Super_Mario_World) without a 512-byte header.
 
-https://github.com/user-attachments/assets/bc8e781c-8fc8-4a88-9fce-41251fe4a63e
+https://github.com/user-attachments/assets/cf636ba9-5a3a-46c7-a4b9-7c7c5c6b3907
 
 # WAIT! But is this really necessary?
 
