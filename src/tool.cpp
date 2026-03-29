@@ -80,7 +80,6 @@ int getOpSize(uint8_t op, const CPUState& state) {
 
 void emitC(std::ofstream& out, const std::vector<uint8_t>& rom, uint32_t pc, CPUState& state, std::deque<uint32_t>& queue) {
     uint8_t op = rom[pc];
-    out << "    addr_0x" << std::hex << pc << ": ";
 
     switch (op) {
         case 0x78: out << "SEI();\n"; break;
@@ -318,31 +317,65 @@ int main(int argc, char** argv) {
 
         while (!end && pc < rom.size()) {
             uint8_t op = rom[pc];
+
+            out << "    addr_0x" << std::hex << pc << ": ;\n";
+            
             if (pc >= 0x7FB0 && pc <= 0x7FFF) break;
             if (op == 0x00) { out << "    return; // Padding\n"; break; }
 
-            // Handling Jumps/Calls
-            if (op == 0x20 || op == 0x22 || op == 0x4C || op == 0x5C) {
-                uint32_t target = snes_to_file(rom[pc+1] | (rom[pc+2] << 8) | (op == 0x22 || op == 0x5C ? (rom[pc+3] << 16) : 0));
-                out << "    sub_0x" << std::hex << target << "();\n";
+            // Handle Jumps and Branches
+            if (op == 0x20 || op == 0x22 || op == 0x4C || op == 0x5C || op == 0x80) {
+                uint32_t target;
+                if (op == 0x80) { // BRA
+                    int8_t offset = (int8_t)rom[pc + 1];
+                    target = (pc & ~0x7FFF) | ((pc + 2 + offset) & 0x7FFF);
+                } else { // JMP, JML, JSR, JSL
+                    uint32_t raw_addr = rom[pc+1] | (rom[pc+2] << 8) | (op == 0x22 || op == 0x5C ? (rom[pc+3] << 16) : 0);
+                    target = snes_to_file(raw_addr);
+                }
+
+                bool isCall = (op == 0x20 || op == 0x22);
+
+                if (visited.count(target)) {
+                    out << "    sub_0x" << std::hex << target << "();\n";
+                    if (!isCall) {
+                        out << "    return;\n"; 
+                        end = true;
+                    }
+                } else {
+                    if (isCall) {
+                        out << "    sub_0x" << std::hex << target << "();\n";
+                    } else {
+                        out << "    goto addr_0x" << std::hex << target << ";\n";
+                        end = true;
+                    }
+                }
                 queue.push_back(target);
-                if (op == 0x4C || op == 0x5C) end = true;
-                pc += (op == 0x20 || op == 0x4C ? 3 : 4);
-            } else if (op == 0x60 || op == 0x6B) {
-                out << "    return;\n";
-                end = true;
-            } else if (op == 0x10 || op == 0x80 || op == 0xD0 || op == 0xF0) {
+                pc += (op == 0x20 || op == 0x4C ? 3 : (op == 0x80 ? 2 : 4));
+            } 
+            else if (op == 0x10 || op == 0xD0 || op == 0xF0) { // BPL, BNE, BEQ
                 int8_t offset = (int8_t)rom[pc + 1];
                 uint32_t target = (pc & ~0x7FFF) | ((pc + 2 + offset) & 0x7FFF);
-                if (op == 0x80) { out << "    goto addr_0x" << std::hex << target << ";\n"; end = true; }
-                else if (op == 0x10) { out << "    if (!regs.P.N) goto addr_0x" << std::hex << target << ";\n"; }
-                else if (op == 0xD0) { out << "    if (!regs.P.Z) goto addr_0x" << std::hex << target << ";\n"; }
-                else { out << "    if (regs.P.Z) goto addr_0x" << std::hex << target << ";\n"; }
+                
+                std::string condition = (op == 0x10) ? "!regs.P.N" : (op == 0xD0 ? "!regs.P.Z" : "regs.P.Z");
+
+                if (visited.count(target)) {
+                    out << "    if (" << condition << ") { sub_0x" << std::hex << target << "(); return; }\n";
+                } else {
+                    out << "    if (" << condition << ") goto addr_0x" << std::hex << target << ";\n";
+                }
                 queue.push_back(target); 
                 pc += 2;
-            } else {
+            }
+            else if (op == 0x60 || op == 0x6B) { // RTS / RTL
+                out << "    return;\n";
+                end = true;
+            }
+            else {
+                // IMPORTANT: Pass current op to get size correctly
+                uint8_t current_op = op; 
                 emitC(out, rom, pc, state, queue);
-                pc += getOpSize(op, state);
+                pc += getOpSize(current_op, state);
             }
         }
         out << "}\n\n";
@@ -357,13 +390,15 @@ int main(int argc, char** argv) {
 
     std::cout << "Generated function_registry.inc with " << std::dec << discovered_subs.size() << " entries." << std::endl;
 
-    std::ofstream proto("function_prototypes.inc");
+    std::ofstream proto("prototypes.h");
+    proto << "#ifndef PROTOTYPES_H\n#define PROTOTYPES_H\n\n";
     for (uint32_t addr : discovered_subs) {
         proto << "void sub_0x" << std::hex << addr << "();\n";
     }
+    proto << "\n#endif // PROTOTYPES_H\n";
     proto.close();
 
-    std::cout << "Generated function_prototypes.inc with " << std::dec << discovered_subs.size() << " entries." << std::endl;
-    
+    std::cout << "Generated prototypes.h with " << std::dec << discovered_subs.size() << " entries." << std::endl;
+
     return 0;
 }
