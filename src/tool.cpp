@@ -6,18 +6,12 @@
 #include <cstdint>
 #include <iomanip>
 #include <map>
+#include "snes_cpu.h"
 
 struct CPUState {
     bool is16A = false;
     bool is16XY = false;
 };
-
-uint32_t snes_to_file(uint32_t addr) {
-    uint8_t bank = (addr >> 16) & 0xFF;
-    uint32_t offset = addr & 0xFFFF;
-    if (offset < 0x8000 && bank < 0x7E) return 0xFFFFFFFF; 
-    return ((bank & 0x7F) << 15) | (offset & 0x7FFF);
-}
 
 // Global to track what state each address should be compiled with
 std::map<uint32_t, CPUState> addr_states;
@@ -237,10 +231,6 @@ void emitC(std::ofstream& out, const std::vector<uint8_t>& rom, uint32_t pc, CPU
             
             out << "    sub_0x" << std::hex << target << "();\n";
             
-            // Check if we already registered this address as a function
-            if (target != 0xFFFFFFFF) {
-                queue.push_back(target); 
-            }
             break;
         }
 
@@ -284,121 +274,183 @@ void emitC(std::ofstream& out, const std::vector<uint8_t>& rom, uint32_t pc, CPU
     }
 }
 
+uint32_t snes_to_file(uint32_t addr) {
+    uint8_t bank = (addr >> 16) & 0xFF;
+    uint32_t offset = addr & 0xFFFF;
+    if (offset < 0x8000 && bank < 0x7E) return 0xFFFFFFFF; 
+    return ((bank & 0x7F) << 15) | (offset & 0x7FFF);
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) return 1;
     std::ifstream file(argv[1], std::ios::binary);
-    if (!file) { std::cerr << "Failed to open ROM\n"; return 1; }
-    
     std::vector<uint8_t> rom((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-    uint32_t snesReset = rom[0x7FFC] | (rom[0x7FFD] << 8);
-    uint32_t startAddr = snes_to_file(snesReset);
+    // 1. Get the Reset Vector
+    uint32_t resetVector = rom[0x7FFC] | (rom[0x7FFD] << 8);
+    uint32_t startAddr = snes_to_file(resetVector);
 
-    std::ofstream out("recompiled_rom.cpp");
-    out << "#include \"snes_cpu.h\"\n\n";
+    // 2. Get the NMI Vector (The "Graphics" Entry Point)
+    uint32_t nmiVector = rom[0x7FEA] | (rom[0x7FEB] << 8);
+    uint32_t nmiAddr = snes_to_file(nmiVector);
 
-    std::deque<uint32_t> queue = { startAddr };
-    std::set<uint32_t> visited;
-    std::vector<uint32_t> discovered_subs;
+    // PASS 1: DISCOVERY
+    // Start with BOTH vectors in the queue
+    std::deque<uint32_t> queue = { startAddr, nmiAddr };
+    std::set<uint32_t> func_addresses = { startAddr, nmiAddr };
+    std::set<uint32_t> visited_discovery;
 
+    std::cout << "Pass 1: Discovering functions..." << std::endl;
     while (!queue.empty()) {
         uint32_t addr = queue.front();
         queue.pop_front();
-        
-        if (visited.count(addr) || addr >= rom.size() || addr == 0xFFFFFFFF) continue;
-        
-        visited.insert(addr);
-        discovered_subs.push_back(addr);
+        if (visited_discovery.count(addr) || addr >= rom.size() || addr == 0xFFFFFFFF) continue;
+        visited_discovery.insert(addr);
 
-        out << "void sub_0x" << std::hex << addr << "() {\n";
         uint32_t pc = addr;
-        CPUState state; 
+        CPUState state;
         bool end = false;
-
         while (!end && pc < rom.size()) {
             uint8_t op = rom[pc];
-
-            out << "    addr_0x" << std::hex << pc << ": ;\n";
             
+            // Boundary checks
             if (pc >= 0x7FB0 && pc <= 0x7FFF) break;
-            if (op == 0x00) { out << "    return; // Padding\n"; break; }
-
-            // Handle Jumps and Branches
+            if (op == 0x00) break; 
+            
             if (op == 0x20 || op == 0x22 || op == 0x4C || op == 0x5C || op == 0x80) {
                 uint32_t target;
-                if (op == 0x80) { // BRA
+                if (op == 0x80) {
                     int8_t offset = (int8_t)rom[pc + 1];
                     target = (pc & ~0x7FFF) | ((pc + 2 + offset) & 0x7FFF);
-                } else { // JMP, JML, JSR, JSL
-                    uint32_t raw_addr = rom[pc+1] | (rom[pc+2] << 8) | (op == 0x22 || op == 0x5C ? (rom[pc+3] << 16) : 0);
-                    target = snes_to_file(raw_addr);
-                }
-
-                bool isCall = (op == 0x20 || op == 0x22);
-
-                if (visited.count(target)) {
-                    out << "    sub_0x" << std::hex << target << "();\n";
-                    if (!isCall) {
-                        out << "    return;\n"; 
-                        end = true;
-                    }
                 } else {
-                    if (isCall) {
-                        out << "    sub_0x" << std::hex << target << "();\n";
-                    } else {
-                        out << "    goto addr_0x" << std::hex << target << ";\n";
-                        end = true;
-                    }
+                    target = snes_to_file(rom[pc+1] | (rom[pc+2] << 8) | (op == 0x22 || op == 0x5C ? (rom[pc+3] << 16) : 0));
                 }
-                queue.push_back(target);
+
+                if (target != 0xFFFFFFFF && func_addresses.find(target) == func_addresses.end()) {
+                    func_addresses.insert(target);
+                    queue.push_back(target);
+                }
+
+                // Unconditional jumps end the current discovery path
+                if (op == 0x4C || op == 0x5C || op == 0x80) end = true;
                 pc += (op == 0x20 || op == 0x4C ? 3 : (op == 0x80 ? 2 : 4));
             } 
-            else if (op == 0x10 || op == 0xD0 || op == 0xF0) { // BPL, BNE, BEQ
+            else if (op == 0x10 || op == 0xD0 || op == 0xF0) {
                 int8_t offset = (int8_t)rom[pc + 1];
                 uint32_t target = (pc & ~0x7FFF) | ((pc + 2 + offset) & 0x7FFF);
                 
-                std::string condition = (op == 0x10) ? "!regs.P.N" : (op == 0xD0 ? "!regs.P.Z" : "regs.P.Z");
-
-                if (visited.count(target)) {
-                    out << "    if (" << condition << ") { sub_0x" << std::hex << target << "(); return; }\n";
-                } else {
-                    out << "    if (" << condition << ") goto addr_0x" << std::hex << target << ";\n";
+                // Track these as potential function starts so they get emitted
+                if (target != 0xFFFFFFFF && func_addresses.find(target) == func_addresses.end()) {
+                    func_addresses.insert(target);
+                    queue.push_back(target);
                 }
-                queue.push_back(target); 
                 pc += 2;
             }
             else if (op == 0x60 || op == 0x6B) { // RTS / RTL
+                end = true; 
+                pc += 1;
+            }
+            else {
+                // Update state if we hit REP/SEP during discovery to get correct instruction sizes
+                if (op == 0xC2) { if (rom[pc+1] & 0x20) state.is16A = true; if (rom[pc+1] & 0x10) state.is16XY = true; }
+                if (op == 0xE2) { if (rom[pc+1] & 0x20) state.is16A = false; if (rom[pc+1] & 0x10) state.is16XY = false; }
+                pc += getOpSize(op, state);
+            }
+        }
+    }
+
+    // PASS 2: EMISSION
+    std::cout << "Pass 2: Emitting C++ code for " << std::dec << func_addresses.size() << " functions..." << std::endl;
+    std::ofstream out("recompiled.cpp");
+    out << "#include \"snes_cpu.h\"\n#include \"prototypes.h\"\n\n";
+
+    for (uint32_t addr : func_addresses) {
+        if (addr >= rom.size() || addr == 0xFFFFFFFF) continue;
+        out << "void sub_0x" << std::hex << addr << "() {\n";
+        uint32_t pc = addr;
+        CPUState state;
+        bool end = false;
+        while (!end && pc < rom.size()) {
+            uint8_t op = rom[pc];
+            out << "    addr_0x" << std::hex << pc << ": ;\n";
+            if (pc >= 0x7FB0 && pc <= 0x7FFF) break;
+            if (op == 0x00) { out << "    return;\n"; break; }
+
+            if (op == 0x20 || op == 0x22 || op == 0x4C || op == 0x5C || op == 0x80) {
+                uint32_t target;
+                if (op == 0x80) {
+                    int8_t offset = (int8_t)rom[pc + 1];
+                    target = (pc & ~0x7FFF) | ((pc + 2 + offset) & 0x7FFF);
+                } else {
+                    target = snes_to_file(rom[pc+1] | (rom[pc+2] << 8) | (op == 0x22 || op == 0x5C ? (rom[pc+3] << 16) : 0));
+                }
+
+                // --- CRITICAL FIX: Skip the 0xFFFFFFFF calls entirely ---
+                if (target == 0xFFFFFFFF || target >= rom.size()) {
+                    out << "    // Invalid target (0x" << std::hex << target << ") - Ending flow\n";
+                    out << "    return;\n";
+                    end = true; // Stop emitting this function's path
+                } else {
+                    bool isCall = (op == 0x20 || op == 0x22);
+                    if (isCall) {
+                        out << "    sub_0x" << std::hex << target << "();\n";
+                    } else {
+                        out << "    next_func_addr = 0x" << std::hex << target << ";\n";
+                        out << "    return;\n";
+                        end = true;
+                    }
+                }
+                pc += (op == 0x20 || op == 0x4C ? 3 : (op == 0x80 ? 2 : 4));
+            }
+            else if (op == 0x10 || op == 0xD0 || op == 0xF0) {
+                int8_t offset = (int8_t)rom[pc + 1];
+                uint32_t target = (pc & ~0x7FFF) | ((pc + 2 + offset) & 0x7FFF);
+                std::string cond = (op == 0x10) ? "!regs.P.N" : (op == 0xD0 ? "!regs.P.Z" : "regs.P.Z");
+                
+                // If the target is inside the CURRENT function we are emitting, use GOTO
+                // (Note: This is a simplified check, ideally you'd track the function range)
+                out << "    if (" << cond << ") { next_func_addr = 0x" << std::hex << target << "; return; }\n";
+                pc += 2;
+            }
+            else if (op == 0x60 || op == 0x6B) {
                 out << "    return;\n";
                 end = true;
             }
             else {
-                // IMPORTANT: Pass current op to get size correctly
-                uint8_t current_op = op; 
                 emitC(out, rom, pc, state, queue);
-                pc += getOpSize(current_op, state);
+                pc += getOpSize(op, state);
             }
         }
         out << "}\n\n";
     }
 
-    // This is the part that was inside the loop previously:
+    func_addresses.erase(0xFFFFFFFF);
+
     std::ofstream reg("function_registry.inc");
-    for (uint32_t addr : discovered_subs) {
-        reg << "function_table[0x" << std::hex << addr << "] = &sub_0x" << addr << ";\n";
+    if (!reg.is_open()) {
+        std::cerr << "Failed to create function_registry.inc" << std::endl;
+        return 1;
+    }
+
+    for (uint32_t addr : func_addresses) {
+        // ONLY register functions that exist within the ROM boundaries
+        if (addr != 0xFFFFFFFF && addr < rom.size()) {
+            reg << "void sub_0x" << std::hex << addr << "(); function_table[0x" << addr << "] = &sub_0x" << addr << ";\n";
+        }
     }
     reg.close();
+    std::cout << "Generated function_registry.inc successfully." << std::endl;
 
-    std::cout << "Generated function_registry.inc with " << std::dec << discovered_subs.size() << " entries." << std::endl;
-
+    // Final Header Generation
     std::ofstream proto("prototypes.h");
     proto << "#ifndef PROTOTYPES_H\n#define PROTOTYPES_H\n\n";
-    for (uint32_t addr : discovered_subs) {
-        proto << "void sub_0x" << std::hex << addr << "();\n";
+    for (uint32_t addr : func_addresses) {
+        if (addr != 0xFFFFFFFF && addr < rom.size()) {
+            proto << "void sub_0x" << std::hex << addr << "();\n";
+        }
     }
-    proto << "\n#endif // PROTOTYPES_H\n";
-    proto.close();
+    proto << "\n#endif\n";
 
-    std::cout << "Generated prototypes.h with " << std::dec << discovered_subs.size() << " entries." << std::endl;
-
+    std::cout << "Final Count: " << std::dec << func_addresses.size() << " functions found." << std::endl;
     return 0;
 }

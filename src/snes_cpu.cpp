@@ -1,405 +1,377 @@
 #include "snes_cpu.h"
 #include <iostream>
 #include <vector>
+#include <chrono>
+#include <thread>
 
+// Global State
 CPURegs regs;
 std::vector<uint8_t> snes_ram(0x20000, 0); // 128KB WRAM
-std::vector<uint8_t> snes_rom;            // Loaded from file
+uint8_t snes_vram[0x10000];               // 64KB VRAM
+uint8_t cgram_address = 0;
+uint8_t palette_data[512]; // 256 colors * 2 bytes
 
-// DMA State
-struct DMAChannel {
-    uint8_t control, dest_reg, source_bk;
-    uint16_t source, size;
-} dma[8];
+uint32_t dma_src_addr[8] = {0};
+uint16_t dma_transfer_size[8] = {0};
+uint8_t dma_dest_reg[8] = {0};
+uint8_t dma_parameters[8] = {0};
 
-// --- Core Memory System ---
+std::map<uint32_t, RecompiledFunc> function_table;
+bool cgram_flip_flop = false; // False = Low byte, True = High byte
 
+int call_depth = 0;
+
+extern std::vector<uint8_t> rom_data;
+
+uint32_t snes_to_file(uint32_t addr) {
+    uint8_t bank = (addr >> 16) & 0xFF;
+    uint32_t offset = addr & 0xFFFF;
+    if (offset < 0x8000 && bank < 0x7E) return 0xFFFFFFFF; 
+    return ((bank & 0x7F) << 15) | (offset & 0x7FFF);
+}
+
+void call_snes_sub(uint32_t addr) {
+    if (function_table.count(addr) && function_table[addr] != nullptr) {
+        function_table[addr]();
+    } else {
+        std::cerr << "[Error] Attempted to call unknown address: 0x" << std::hex << addr << std::endl;
+        exit(1); // Stop before it crashes hard
+    }
+}
+
+void update_nz(uint16_t val, bool is8bit) {
+    if (is8bit) {
+        regs.P.Z = ((uint8_t)val == 0);
+        regs.P.N = (((uint8_t)val & 0x80) != 0);
+    } else {
+        regs.P.Z = (val == 0);
+        regs.P.N = ((val & 0x8000) != 0);
+    }
+}
+
+uint32_t next_func_addr = 0;
+
+uint8_t pack_status() {
+    uint8_t res = 0;
+    if (regs.P.C) res |= 0x01;
+    if (regs.P.Z) res |= 0x02;
+    if (regs.P.I) res |= 0x04;
+    if (regs.P.D) res |= 0x08;
+    if (regs.P.X_flag) res |= 0x10;
+    if (regs.P.M) res |= 0x20;
+    if (regs.P.V) res |= 0x40;
+    if (regs.P.N) res |= 0x80;
+    return res;
+}
+
+void unpack_status(uint8_t res) {
+    regs.P.C = res & 0x01;
+    regs.P.Z = res & 0x02;
+    regs.P.I = res & 0x04;
+    regs.P.D = res & 0x08;
+    regs.P.X_flag = res & 0x10;
+    regs.P.M = res & 0x20;
+    regs.P.V = res & 0x40;
+    regs.P.N = res & 0x80;
+}
+
+// Memory System
 uint8_t snes_memory_read(uint32_t addr) {
     uint8_t bank = (addr >> 16) & 0xFF;
     uint32_t offset = addr & 0xFFFF;
 
-    // Work RAM (7E:0000-7F:FFFF)
-    if (bank == 0x7E || bank == 0x7F) {
-        return snes_ram[((bank & 1) << 16) | offset];
-    }
-    
-    // LoROM Mirroring
-    if (offset >= 0x8000) {
-        uint32_t rom_addr = ((bank & 0x7F) << 15) | (offset & 0x7FFF);
-        if (rom_addr < snes_rom.size()) return snes_rom[rom_addr];
+    // --- MIRRORING FIX ---
+    // Banks $00-$3F and $80-$BF mirror WRAM at $0000-$1FFF
+    if ((bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) && offset < 0x2000) {
+        return snes_ram[offset];
     }
 
-    // Direct Page / Registers mirroring in low banks
-    if (bank < 0x40 && offset < 0x2000) {
-        return snes_ram[offset]; // Mirror first 8KB of WRAM
+    // Official WRAM Banks
+    if (bank == 0x7E || bank == 0x7F) {
+        uint32_t ram_addr = ((bank & 0x01) << 16) | offset;
+        if (ram_addr < snes_ram.size()) return snes_ram[ram_addr];
+    }
+
+    // ROM Access (LoROM)
+    if (bank < 0x40 && offset >= 0x8000) {
+        uint32_t file_addr = snes_to_file(addr);
+        if (file_addr < rom_data.size()) return rom_data[file_addr];
+    }
+
+    // Hardware Registers
+    if (bank < 0x40) {
+        if (offset == 0x4212) return 0x81; // V-Blank + Joypad Ready
+        if (offset == 0x213F) return 0x80; // PPU Status
     }
 
     return 0;
 }
 
-// Pull a single byte from the stack
-uint8_t snes_stack_pull() {
-    // In 65816, we increment the stack pointer first, then read
-    regs.S++;
-    
-    // In Emulation mode (E=1), the high byte of S is forced to 0x01
-    if (regs.P.E) {
-        regs.S = (regs.S & 0xFF) | 0x0100;
-    }
-    
-    return snes_memory_read(regs.S);
-}
+void execute_dma(int ch) {
+    uint32_t src = dma_src_addr[ch];
+    uint32_t size = dma_transfer_size[ch] == 0 ? 0x10000 : dma_transfer_size[ch];
+    uint8_t dest_reg = dma_dest_reg[ch];
 
-// Push a single byte onto the stack
-void snes_stack_push(uint8_t val) {
-    snes_memory_write(regs.S, val);
-    
-    // Decrement stack pointer
-    regs.S--;
-    
-    // In Emulation mode, keep S within page 1
-    if (regs.P.E) {
-        regs.S = (regs.S & 0xFF) | 0x0100;
-    }
-}
+    // Log the transfer
+    std::cout << "[DMA] Ch" << ch << ": 0x" << std::hex << src 
+              << " -> PPU Reg 0x21" << (int)dest_reg << " Size: 0x" << size << std::endl;
 
-uint32_t get_addr_ind_long_y(uint8_t dp_offset) {
-    uint32_t base = snes_memory_read(regs.D + dp_offset);
-    base |= (snes_memory_read(regs.D + dp_offset + 1) << 8);
-    base |= (snes_memory_read(regs.D + dp_offset + 2) << 16);
-    return base + regs.Y;
+    for (uint32_t i = 0; i < size; i++) {
+        uint8_t data = 0;
+        uint8_t bank = (src >> 16) & 0xFF;
+        uint32_t offset = src & 0xFFFF;
+
+        // READ: From ROM or RAM
+        if (bank < 0x40 && offset >= 0x8000) {
+            uint32_t file_addr = snes_to_file(src);
+            if (file_addr < rom_data.size()) data = rom_data[file_addr];
+        } else {
+            data = snes_memory_read(src);
+        }
+
+        // WRITE: To PPU Registers
+        // 0x22 is Palette Data, 0x18 is VRAM Data, etc.
+        if (dest_reg == 0x22) { // Palette Data
+            if (!cgram_flip_flop) {
+                palette_data[cgram_address * 2] = data; // Use 'data', NOT 'regs.A'
+                cgram_flip_flop = true;
+            } else {
+                palette_data[cgram_address * 2 + 1] = data;
+                if (cgram_address == 0) {
+                    uint16_t color = palette_data[0] | (palette_data[1] << 8);
+                    std::cout << "[PPU] DMA Background Set: 0x" << std::hex << color << std::endl;
+                }
+                cgram_address++;
+                cgram_flip_flop = false;
+            }
+        }
+        // $2118 is VRAM Data - SMW uses this for the logo tiles
+        else if (dest_reg == 0x18) {
+             // Future: snes_vram[vram_addr] = data;
+        }
+        
+        // Handle address increment (standard DMA mode)
+        if (!(dma_parameters[ch] & 0x08)) src++;
+    }
 }
 
 void snes_memory_write(uint32_t addr, uint8_t val) {
     uint8_t bank = (addr >> 16) & 0xFF;
     uint32_t offset = addr & 0xFFFF;
 
-    // WRAM Write
-    if (bank == 0x7E || bank == 0x7F) {
-        snes_ram[((bank & 1) << 16) | offset] = val;
-        return;
-    }
-
-    // Mirror low WRAM
-    if (bank < 0x40 && offset < 0x2000) {
-        snes_ram[offset] = val;
-        return;
-    }
-
-    // DMA Register Logic
-    if ((offset & 0xFF80) == 0x4300) {
-        int ch = (offset >> 4) & 0x7;
-        switch (offset & 0xF) {
-            case 0x0: dma[ch].control = val; break;
-            case 0x1: dma[ch].dest_reg = val; break;
-            case 0x2: dma[ch].source = (dma[ch].source & 0xFF00) | val; break;
-            case 0x3: dma[ch].source = (dma[ch].source & 0x00FF) | (val << 8); break;
-            case 0x4: dma[ch].source_bk = val; break;
-            case 0x5: dma[ch].size = (dma[ch].size & 0xFF00) | val; break;
-            case 0x6: dma[ch].size = (dma[ch].size & 0x00FF) | (val << 8); break;
+    // 1. Intercept DMA Channel Setup ($4300 - $437F)
+    if ((addr & 0xFF80) == 0x4300) {
+        int ch = (addr >> 4) & 0x7; // Get channel 0-7
+        int reg = addr & 0xF;       // Get register 0-F
+        
+        switch(reg) {
+            case 0x0: dma_parameters[ch] = val; break;
+            case 0x1: dma_dest_reg[ch] = val; break;
+            case 0x2: dma_src_addr[ch] = (dma_src_addr[ch] & 0xFFFF00) | val; break;
+            case 0x3: dma_src_addr[ch] = (dma_src_addr[ch] & 0xFF00FF) | (val << 8); break;
+            case 0x4: dma_src_addr[ch] = (dma_src_addr[ch] & 0x00FFFF) | (val << 16); break;
+            case 0x5: dma_transfer_size[ch] = (dma_transfer_size[ch] & 0xFF00) | val; break;
+            case 0x6: dma_transfer_size[ch] = (dma_transfer_size[ch] & 0x00FF) | (val << 8); break;
         }
     }
 
-    if (offset == 0x420b && (val & 0x01)) execute_dma(0);
-}
-
-// --- Helpers ---
-
-inline void update_nz(uint16_t val, bool is_8bit) {
-    regs.P.Z = (val == 0);
-    regs.P.N = (is_8bit ? (val & 0x80) : (val & 0x8000)) ? 0x80 : 0;
-}
-
-void snes_stack_push(uint16_t val, bool is_8bit) {
-    snes_memory_write(regs.S--, val & 0xFF);
-    if (!is_8bit) snes_memory_write(regs.S--, val >> 8);
-}
-
-uint16_t snes_stack_pop(bool is_8bit) {
-    uint16_t val = 0;
-    if (!is_8bit) val = snes_memory_read(++regs.S) << 8;
-    val |= snes_memory_read(++regs.S);
-    return val;
-}
-
-// Opcode 0x5C: JML long indirect [addr]
-// Used in sub_0x6df for dynamic jumps. 
-// NOTE: In a recompiler, we return the target address or use a function pointer map.
-uint32_t JML_ind(uint8_t dp_offset) {
-    uint32_t target = snes_memory_read(regs.D + dp_offset);
-    target |= (snes_memory_read(regs.D + dp_offset + 1) << 8);
-    target |= (snes_memory_read(regs.D + dp_offset + 2) << 16);
-    return target; 
-}
-
-// --- Instructions ---
-
-void LDA_imm(uint16_t val) {
-    regs.A = val;
-    update_nz(regs.A, regs.P.M);
-}
-
-void LDX_imm(uint16_t val) {
-    regs.X = val;
-    update_nz(regs.X, regs.P.X_flag);
-}
-
-void LDY_imm(uint16_t val) {
-    regs.Y = val;
-    update_nz(regs.Y, regs.P.X_flag);
-}
-
-void STA_long(uint32_t addr) {
-    snes_memory_write(addr, regs.A & 0xFF);
-    if (!regs.P.M) snes_memory_write(addr + 1, regs.A >> 8);
-}
-
-void STA_long_x(uint32_t addr) {
-    STA_long(addr + regs.X);
-}
-
-void ADC_imm(uint16_t val) {
-    uint32_t a = regs.A;
-    uint32_t sum = a + val + (regs.P.C ? 1 : 0);
-    uint32_t mask = regs.P.M ? 0xFF : 0xFFFF;
-    uint32_t sign = regs.P.M ? 0x80 : 0x8000;
-
-    regs.P.V = (~(a ^ val) & (a ^ sum) & sign) ? 1 : 0;
-    regs.P.C = sum > mask;
-    regs.A = sum & mask;
-    update_nz(regs.A, regs.P.M);
-}
-
-void SBC_imm(uint16_t val) {
-    ADC_imm(~val & (regs.P.M ? 0xFF : 0xFFFF));
-}
-
-void DEX() {
-    regs.X = (regs.X - 1) & (regs.P.X_flag ? 0xFF : 0xFFFF);
-    update_nz(regs.X, regs.P.X_flag);
-}
-
-void DEY() {
-    regs.Y = (regs.Y - 1) & (regs.P.X_flag ? 0xFF : 0xFFFF);
-    update_nz(regs.Y, regs.P.X_flag);
-}
-
-void TXS() { regs.S = regs.X; } // Note: Native S is 16-bit
-void TXY() { regs.Y = regs.X; update_nz(regs.Y, regs.P.X_flag); }
-void TYA() { regs.A = regs.Y; update_nz(regs.A, regs.P.M); }
-
-void PLX() { regs.X = snes_stack_pop(regs.P.X_flag); update_nz(regs.X, regs.P.X_flag); }
-void PLY() { regs.Y = snes_stack_pop(regs.P.X_flag); update_nz(regs.Y, regs.P.X_flag); }
-
-void REP(uint8_t val) {
-    if (val & 0x20) regs.P.M = 0;
-    if (val & 0x10) regs.P.X_flag = 0;
-}
-
-void SEP(uint8_t val) {
-    if (val & 0x20) regs.P.M = 1;
-    if (val & 0x10) regs.P.X_flag = 1;
-}
-
-void XCE() {
-    bool temp = regs.P.C;
-    regs.P.C = 0; // Switching to Native (Standard for SMW)
-    // In a full emu, this would swap M/X flags, but we assume Native.
-}
-
-// Opcode 0x05: ORA dp (OR with Direct Page)
-void ORA_dp(uint8_t offset) {
-    uint16_t val = snes_memory_read(regs.D + offset);
-    if (!regs.P.M) val |= (snes_memory_read(regs.D + offset + 1) << 8);
-    regs.A |= val;
-    update_nz(regs.A, regs.P.M);
-}
-
-// Opcode 0x10: BPL (Branch if Plus / N flag is 0)
-// This is handled by the recompiler's "if (!regs.P.N) goto ..." logic, so no separate function is needed.
-
-// Opcode 0x2A: ROL Accumulator
-void ROL_acc() {
-    uint32_t mask = regs.P.M ? 0x80 : 0x8000;
-    uint32_t limit = regs.P.M ? 0xFF : 0xFFFF;
-    uint8_t old_carry = regs.P.C;
-    regs.P.C = (regs.A & mask) ? 1 : 0;
-    regs.A = ((regs.A << 1) | old_carry) & limit;
-    update_nz(regs.A, regs.P.M);
-}
-
-// Opcode 0x3A: DEC Accumulator
-void DEC_acc() {
-    regs.A = (regs.A - 1) & (regs.P.M ? 0xFF : 0xFFFF);
-    update_nz(regs.A, regs.P.M);
-}
-
-// Opcode 0x1A: INC Accumulator
-void INC_acc() {
-    regs.A = (regs.A + 1) & (regs.P.M ? 0xFF : 0xFFFF);
-    update_nz(regs.A, regs.P.M);
-}
-
-// Opcode 0xEB: XBA (Exchange B and A - swaps high and low bytes of A)
-void XBA() {
-    uint8_t low = regs.A & 0xFF;
-    uint8_t high = (regs.A >> 8) & 0xFF;
-    regs.A = (low << 8) | high;
-    // XBA only updates N/Z based on the NEW low byte (the old high byte)
-    update_nz(low, true); 
-}
-
-// Opcode 0x0F: ORA long (24-bit address)
-void ORA_long(uint32_t addr) {
-    uint16_t val = snes_memory_read(addr);
-    if (!regs.P.M) val |= (snes_memory_read(addr + 1) << 8);
-    regs.A |= val;
-    update_nz(regs.A, regs.P.M);
-}
-
-// Opcode 0xAF: LDA long (24-bit address)
-void LDA_long(uint32_t addr) {
-    regs.A = snes_memory_read(addr);
-    if (!regs.P.M) regs.A |= (snes_memory_read(addr + 1) << 8);
-    update_nz(regs.A, regs.P.M);
-}
-
-// Opcode 0xB7: LDA [dp], y
-void LDA_ind_long_y(uint8_t dp_offset) {
-    uint32_t addr = get_addr_ind_long_y(dp_offset);
-    regs.A = snes_memory_read(addr);
-    if (!regs.P.M) regs.A |= (snes_memory_read(addr + 1) << 8);
-    update_nz(regs.A, regs.P.M);
-}
-
-// Opcode 0x97: STA [dp], y
-void STA_ind_long_y(uint8_t dp_offset) {
-    uint32_t addr = get_addr_ind_long_y(dp_offset);
-    snes_memory_write(addr, regs.A & 0xFF);
-    if (!regs.P.M) snes_memory_write(addr + 1, regs.A >> 8);
-}
-
-// Opcode 0x66: ROL dp
-void ROL_dp(uint8_t dp_offset) {
-    uint16_t val = snes_memory_read(regs.D + dp_offset);
-    uint8_t old_carry = regs.P.C;
-    regs.P.C = (val & 0x80) ? 1 : 0;
-    val = ((val << 1) | old_carry) & 0xFF;
-    snes_memory_write(regs.D + dp_offset, (uint8_t)val);
-    update_nz(val, true);
-}
-
-// Opcode 0x0F: ORA long (24-bit)
-void ORA_long(uint32_t addr) {
-    uint16_t val = snes_memory_read(addr);
-    if (!regs.P.M) val |= (snes_memory_read(addr + 1) << 8);
-    regs.A |= val;
-    update_nz(regs.A, regs.P.M);
-}
-
-// Opcode 0x9A: TXS (Transfer X to Stack)
-void TXS() {
-    regs.S = regs.X;
-    // Note: TXS does not affect flags
-}
-
-// Opcode 0x6F: ADC long (24-bit)
-void ADC_long(uint32_t addr) {
-    uint32_t val = snes_memory_read(addr);
-    if (!regs.P.M) val |= (snes_memory_read(addr + 1) << 8);
-    
-    uint32_t sum = regs.A + val + regs.P.C;
-    regs.P.V = (~(regs.A ^ val) & (regs.A ^ sum) & (regs.P.M ? 0x80 : 0x8000)) ? 1 : 0;
-    regs.A = sum & (regs.P.M ? 0xFF : 0xFFFF);
-    regs.P.C = (sum > (regs.P.M ? 0xFF : 0xFFFF)) ? 1 : 0;
-    update_nz(regs.A, regs.P.M);
-}
-
-// Opcode 0x9B: TXY (Transfer X to Y)
-void TXY() {
-    regs.Y = regs.X;
-    update_nz(regs.Y, regs.P.X);
-}
-
-// Opcode 0xFA: PLX (Pull Index X)
-void PLX() {
-    regs.X = snes_stack_pull(); // Pull Low Byte
-    if (!regs.P.X) {
-        // If 16-bit, pull High Byte and combine
-        regs.X |= (snes_stack_pull() << 8); 
+    // 2. Intercept DMA Trigger ($420B)
+    if (addr == 0x420b) {
+        // If val is 0, let's see what is actually in the Accumulator
+        if (val == 0) {
+            std::cout << "[Debug] DMA Triggered with 0. Reg A is: 0x" << std::hex << regs.A << std::endl;
+            // Force a channel 0 trigger if the game seems to be stuck
+            val = (regs.A & 0xFF); 
+        }
+        
+        for (int i = 0; i < 8; i++) {
+            if (val & (1 << i)) execute_dma(i);
+        }
     }
-    update_nz(regs.X, regs.P.X);
-}
 
-// Opcode 0x87: STA [dp] (Direct Page Indirect Long)
-void STA_dp_ind_long(uint8_t dp_offset) {
-    uint32_t addr = snes_memory_read(regs.D + dp_offset);
-    addr |= (snes_memory_read(regs.D + dp_offset + 1) << 8);
-    addr |= (snes_memory_read(regs.D + dp_offset + 2) << 16);
-    
-    snes_memory_write(addr, regs.A & 0xFF);
-    if (!regs.P.M) snes_memory_write(addr + 1, regs.A >> 8);
-}
-
-// Opcode 0x96: STX dp, Y (Store X to Direct Page, Y-indexed)
-void STX_dp_y(uint8_t dp_offset) {
-    uint16_t addr = (regs.D + dp_offset + regs.Y) & 0xFFFF;
-    snes_memory_write(addr, regs.X & 0xFF);
-    if (!regs.P.X) snes_memory_write(addr + 1, regs.X >> 8);
-}
-
-// Opcode 0x91: STA (dp), y
-void STA_ind_y(uint8_t offset) {
-    uint32_t base = snes_memory_read(regs.D + offset);
-    base |= (snes_memory_read(regs.D + offset + 1) << 8);
-    // Use the Data Bank Register (DBR) for the high byte
-    uint32_t addr = (regs.DBR << 16) | base;
-    addr += regs.Y;
-
-    snes_memory_write(addr, regs.A & 0xFF);
-    if (!regs.P.M) snes_memory_write(addr + 1, regs.A >> 8);
-}
-
-// Opcode 0x97: STA [dp], Y (Direct Page Indirect Long, Y-indexed)
-void STA_ind_long_y(uint8_t dp_offset) {
-    uint32_t addr = snes_memory_read(regs.D + dp_offset);
-    addr |= (snes_memory_read(regs.D + dp_offset + 1) << 8);
-    addr |= (snes_memory_read(regs.D + dp_offset + 2) << 16);
-    addr += regs.Y;
-    
-    snes_memory_write(addr, regs.A & 0xFF);
-    if (!regs.P.M) snes_memory_write(addr + 1, regs.A >> 8);
-}
-
-void JML_ind(uint16_t addr) {
-    // Read the 24-bit pointer from memory (usually in Bank 0 or WRAM)
-    uint32_t target = snes_memory_read(addr);
-    target |= (snes_memory_read(addr + 1) << 8);
-    target |= (snes_memory_read(addr + 2) << 16);
-
-    // Dynamic Dispatch: Convert the SNES jump into a C++ function call
-    if (function_table.count(target)) {
-        function_table[target]();
-    } else {
-        printf("FAILED: Jumped to uncompiled address 0x%06X\n", target);
+    // ... your existing WRAM/RAM write logic ...
+    if (bank == 0x7E || bank == 0x7F) {
+        uint32_t ram_addr = ((bank & 0x01) << 16) | offset;
+        if (ram_addr < snes_ram.size()) snes_ram[ram_addr] = val;
+    } 
+    else if (bank < 0x40 && offset < 0x2000) {
+        snes_ram[offset] = val;
     }
 }
 
-void LDA_dp(uint8_t offset) {
-    // HACK: If the game is checking address 0x10, simulate a V-Blank happened
-    if (offset == 0x10) snes_memory_write(0x10, 1); 
+void sub_0xffffffff() {
+    // This is a landing pad for broken jumps
+    std::cerr << "[CPU] Error: Jumped to an invalid address (0xFFFFFFFF)" << std::endl;
+}
 
+// --- System & Control ---
+void SEI() { regs.P.I = 1; }
+void CLI() { regs.P.I = 0; }
+void CLC() { regs.P.C = 0; }
+void SEC() { regs.P.C = 1; }
+void XCE() { bool temp = regs.P.C; regs.P.C = regs.P.E; regs.P.E = temp; }
+void REP(uint8_t val) { if (val & 0x20) regs.P.M = 0; if (val & 0x10) regs.P.X_flag = 0; }
+void SEP(uint8_t val) { if (val & 0x20) regs.P.M = 1; if (val & 0x10) regs.P.X_flag = 1; }
+void XBA() { uint8_t low = regs.A & 0xFF; uint8_t high = (regs.A >> 8) & 0xFF; regs.A = (low << 8) | high; }
+void NOP() {}
+
+// --- Load & Store ---
+void LDA_imm(uint16_t val) { 
+    regs.A = val; 
+    update_nz(regs.A, regs.P.M); 
+    // std::cout << "[CPU] LDA Imm: 0x" << std::hex << val << std::endl; 
+}
+void LDA_abs(unsigned short addr) {
+    regs.A = snes_memory_read(addr);
+    if (!regs.P.M) {
+        regs.A |= (snes_memory_read(addr + 1) << 8);
+    }
+    update_nz(regs.A, regs.P.M);
+}
+void LDA_dp(unsigned char offset) {
+    // If the game is polling $10 (V-blank wait), slow it down 
+    // so the UI thread has time to update snes_ram[0x10]
+    if (offset == 0x10) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    
     regs.A = snes_memory_read(regs.D + offset);
-    if (!regs.P.M) regs.A |= (snes_memory_read(regs.D + offset + 1) << 8);
     update_nz(regs.A, regs.P.M);
 }
+void LDA_abs_x(unsigned short addr) { regs.A = snes_memory_read(addr + regs.X); update_nz(regs.A, regs.P.M); }
+void LDX_imm(uint16_t val) { regs.X = val; update_nz(regs.X, regs.P.X_flag); }
+void LDX_abs(unsigned short addr) { regs.X = snes_memory_read(addr); update_nz(regs.X, regs.P.X_flag); }
+void LDY_imm(uint16_t val) { regs.Y = val; update_nz(regs.Y, regs.P.X_flag); }
+void LDY_dp(unsigned char offset) { regs.Y = snes_memory_read(regs.D + offset); update_nz(regs.Y, regs.P.X_flag); }
 
-void execute_dma(int ch) {
-    uint32_t src = (dma[ch].source_bk << 16) | dma[ch].source;
-    uint32_t dest = 0x2100 + dma[ch].dest_reg;
-    uint32_t len = dma[ch].size == 0 ? 0x10000 : dma[ch].size;
+void STA_abs(unsigned short addr) {
+    uint8_t val = regs.A & 0xFF;
+    snes_memory_write(addr, val);
 
-    for (uint32_t i = 0; i < len; i++) {
-        snes_memory_write(dest, snes_memory_read(src + i));
+    // Log EVERY write to the PPU registers (0x2100 range)
+    if (addr >= 0x2100 && addr <= 0x2133) {
+        std::cout << "[Debug] PPU Write to 0x" << std::hex << addr << " Value: 0x" << (int)(regs.A & 0xFF) << std::endl;
     }
+
+    if (addr == 0x2100) {
+        if (val & 0x80) {
+            // Screen is forced to black
+        } else {
+            std::cout << "[PPU] Screen Enabled! Brightness: " << (val & 0x0F) << std::endl;
+        }
+    }
+
+    // 2. Hardware Register Interception
+    // $2121: CGRAM Address (Palette Index)
+    if (addr == 0x2121) {
+        cgram_address = (regs.A & 0xFF);
+        cgram_flip_flop = false; // Reset flip-flop on address change
+    }
+    // $2122: CGRAM Data (Palette Color)
+    else if (addr == 0x2122) {
+        uint8_t val = (regs.A & 0xFF);
+        // ... (your existing flip-flop logic) ...
+        if (cgram_address == 0 && cgram_flip_flop == false) {
+             uint16_t color = palette_data[0] | (palette_data[1] << 8);
+             // THIS LOG IS CRITICAL. If you see this, the screen MUST change color.
+             std::cout << "[PPU] Background Color updated to: 0x" << std::hex << color << std::endl;
+        }
+    }
+}
+void STA_dp(unsigned char offset) { snes_memory_write(regs.D + offset, regs.A & 0xFF); }
+void STA_abs_x(unsigned short addr) { snes_memory_write(addr + regs.X, regs.A & 0xFF); }
+void STX_abs(unsigned short addr) { snes_memory_write(addr, regs.X & 0xFF); }
+void STX_dp(unsigned char offset) { snes_memory_write(regs.D + offset, regs.X & 0xFF); }
+void STY_dp(unsigned char offset) { snes_memory_write(regs.D + offset, regs.Y & 0xFF); }
+
+void STZ_abs(unsigned short addr) { snes_memory_write(addr, 0); snes_memory_write(addr + 1, 0); }
+void STZ_dp(unsigned char offset) { snes_memory_write(regs.D + offset, 0); }
+void STZ_abs_x(unsigned short addr) { snes_memory_write(addr + regs.X, 0); }
+void STZ_dp_x(unsigned char offset) { snes_memory_write(regs.D + offset + regs.X, 0); }
+
+// --- Transfers & Stack (FIXED) ---
+void TAX() { regs.X = regs.A; update_nz(regs.X, regs.P.X_flag); }
+void TAY() { regs.Y = regs.A; update_nz(regs.Y, regs.P.X_flag); }
+void TXA() { regs.A = regs.X; update_nz(regs.A, regs.P.M); }
+void TYA() { regs.A = regs.Y; update_nz(regs.A, regs.P.M); }
+void TSX() { regs.X = regs.S; update_nz(regs.X, regs.P.X_flag); }
+void TXS() { regs.S = regs.X; }
+void TXY() { regs.Y = regs.X; update_nz(regs.Y, regs.P.X_flag); }
+void TCD() { regs.D = regs.A; }
+void TCS() { regs.S = regs.A; }
+
+// Use snes_memory_write to ensure the stack stays in WRAM Bank 0
+void PHA() { snes_memory_write(regs.S--, regs.A & 0xFF); if(!regs.P.M) snes_memory_write(regs.S--, (regs.A >> 8) & 0xFF); }
+void PLA() { if(!regs.P.M) regs.A = (snes_memory_read(++regs.S) << 8); regs.A |= snes_memory_read(++regs.S); update_nz(regs.A, regs.P.M); }
+void PHX() { snes_memory_write(regs.S--, regs.X & 0xFF); if(!regs.P.X_flag) snes_memory_write(regs.S--, (regs.X >> 8) & 0xFF); }
+void PLX() { if(!regs.P.X_flag) regs.X = (snes_memory_read(++regs.S) << 8); regs.X |= snes_memory_read(++regs.S); update_nz(regs.X, regs.P.X_flag); }
+void PHY() { snes_memory_write(regs.S--, regs.Y & 0xFF); if(!regs.P.X_flag) snes_memory_write(regs.S--, (regs.Y >> 8) & 0xFF); }
+void PLY() { if(!regs.P.X_flag) regs.Y = (snes_memory_read(++regs.S) << 8); regs.Y |= snes_memory_read(++regs.S); update_nz(regs.Y, regs.P.X_flag); }
+void PHP() { 
+    snes_memory_write(regs.S--, pack_status()); 
+}
+
+void PLP() { 
+    unpack_status(snes_memory_read(++regs.S)); 
+}
+
+void PEA(unsigned short addr) { 
+    snes_memory_write(regs.S--, (addr >> 8) & 0xFF); 
+    snes_memory_write(regs.S--, addr & 0xFF); 
+}
+
+// --- Arithmetic & Logical ---
+void INX() { regs.X++; update_nz(regs.X, regs.P.X_flag); }
+void INY() { regs.Y++; update_nz(regs.Y, regs.P.X_flag); }
+void DEX() { regs.X--; update_nz(regs.X, regs.P.X_flag); }
+void DEY() { regs.Y--; update_nz(regs.Y, regs.P.X_flag); }
+void INC_acc() { regs.A++; update_nz(regs.A, regs.P.M); }
+void INC_dp(unsigned char offset) { /* Implement */ }
+
+void AND_imm(uint16_t val) { regs.A &= val; update_nz(regs.A, regs.P.M); }
+void ORA_imm(uint16_t val) { regs.A |= val; update_nz(regs.A, regs.P.M); }
+void ADC_imm(uint16_t val) { /* Implement */ }
+void SBC_imm(uint16_t val) { /* Implement */ }
+
+void CMP_abs(unsigned short addr) { /* Implement */ }
+void CMP_ind_y(unsigned char offset) { /* Implement */ }
+void CPX_imm(uint16_t val) { /* Implement */ }
+
+// --- Long & Indirect ---
+void LDA_long(unsigned int addr) { regs.A = snes_memory_read(addr); update_nz(regs.A, regs.P.M); }
+void STA_long(unsigned int addr) { snes_memory_write(addr, regs.A & 0xFF); }
+void STA_long_x(unsigned int addr) { snes_memory_write(addr + regs.X, regs.A & 0xFF); }
+void LDA_ind_x(unsigned char offset) {}
+void LDA_ind_long_y(unsigned char offset) {}
+void STA_ind_y(unsigned char offset) {}
+void STA_ind_long(unsigned char offset) {}
+void STA_ind_long_y(unsigned char offset) {}
+void STX_dp_y(unsigned char offset) {}
+void STY_dp_x(unsigned char offset) {}
+void LDX_abs_y(unsigned short addr) {}
+void ADC_dp(unsigned char offset) {}
+void ADC_long(unsigned int addr) {}
+void SBC_long_x(unsigned int addr) {}
+void AND_ind_long_y(unsigned char offset) {}
+void ORA_dp(unsigned char offset) {}
+void ORA_dp_x(unsigned char offset) {}
+void ORA_long(unsigned int addr) {}
+void ORA_stack(unsigned char offset) {}
+void ORA_ind_x(unsigned char offset) {}
+void ORA_ind_long(unsigned char offset) {}
+void EOR_sr_ind_y(unsigned char offset) {}
+
+void ASL_acc() { regs.A <<= 1; update_nz(regs.A, regs.P.M); }
+void LSR_acc() { regs.A >>= 1; update_nz(regs.A, regs.P.M); }
+void ROL_dp(unsigned char offset) {}
+void JML_ind(unsigned short addr) {}
+
+void register_functions() {
+    std::cout << "[System] Initializing Function Registry..." << std::endl;
+#if __has_include("function_registry.inc")
+    #include "function_registry.inc"
+    std::cout << "[System] " << function_table.size() << " functions registered." << std::endl;
+#else
+    std::cout << "[System] Warning: function_registry.inc not found. Run the RecompTool first!" << std::endl;
+#endif
 }
