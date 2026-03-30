@@ -20,6 +20,9 @@ Recompiled games can run as standalone apps (no emulator needed) and be ported t
 # 3 - Modding & reverse engineering
 A static recompiler allows you to modify a game in C++ instead of [Assembly](https://en.wikipedia.org/wiki/Assembly_language). Which makes the process of making mods for the game much easier. The bad news is a Static Recompiler does not generate readable human code. You have function names like `sub_0xXXXX` address names like `addr_0xXXXX`. The good news is that [we](https://github.com/ExpansionPak) are been planning to release a Table that documents these recompiled functions and lists a possible function name for the specific function in each game. Like `UpdateMarioPhysics()` or `HandleMarioPhysics()`.
 
+# DISCLAIMER!
+The only game that currently works with this tool is Super Mario World. If you try to use the tool with a different game like [Donkey Kong Country](https://en.wikipedia.org/wiki/Donkey_Kong_Country). You will get empty generated CPP code. The tool itself has only been tested with a clean dump of Super Mario World that does not include a 512-Byte header. So the generated CPP code might be different if you do have a dump of Super Mario World that includes a 512-Byte header (Usually present in .smc files).
+
 # Instructions
 First. Download [MSYS2](https://www.msys2.org/) and [CMake](https://cmake.org/download/). [Ninja](https://github.com/ninja-build/ninja/releases) is also heavily recommended.
 
