@@ -1,5 +1,7 @@
 [![image](misc/SRecomp.png)](https://github.com/ExpansionPak/SuperRecomp)
 
+NOTE: This project has been abandoned and will no longer continue to recieve updates. If anyone wants to take ownership of this project, please let me know on my discord (elderthesmall)
+
 # SuperRecomp
 A tool to statically recompile [SNES](https://en.wikipedia.org/wiki/Super_Nintendo_Entertainment_System) games into native executables. It works by reading the raw bytes of a ROM and then generate [C++](https://en.wikipedia.org/wiki/C%2B%2B) code of the game. The project is in a very early stage. So while C++ code generation is okay as of now. It still needs a few more polishing to be compiled without any errors.
 
